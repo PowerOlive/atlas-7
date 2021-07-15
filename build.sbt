@@ -10,16 +10,13 @@ lazy val atlas = project.in(file("."))
     `atlas-json`,
     `atlas-lwcapi`,
     `atlas-module-akka`,
-    `atlas-module-cloudwatch`,
     `atlas-module-eval`,
     `atlas-module-lwcapi`,
     `atlas-module-webapi`,
-    `atlas-poller`,
-    `atlas-poller-cloudwatch`,
     `atlas-standalone`,
     `atlas-webapi`,
     `atlas-wiki`)
-  .settings(skip in publish := true)
+  .settings(publish / skip := true)
 
 lazy val `atlas-akka` = project
   .configure(BuildSettings.profile)
@@ -94,20 +91,8 @@ lazy val `atlas-lwcapi` = project
 lazy val `atlas-module-akka` = project
   .configure(BuildSettings.profile)
   .dependsOn(`atlas-akka`)
-  .settings(libraryDependencies ++= Seq(
-    Dependencies.guiceCore,
-    Dependencies.guiceMulti,
+  .settings(libraryDependencies ++= Dependencies.guiceCoreAndMulti ++ Seq(
     Dependencies.iepGuice
-  ))
-
-lazy val `atlas-module-cloudwatch` = project
-  .configure(BuildSettings.profile)
-  .dependsOn(`atlas-module-akka`, `atlas-poller-cloudwatch`)
-  .settings(libraryDependencies ++= Seq(
-    Dependencies.guiceCore,
-    Dependencies.guiceMulti,
-    Dependencies.iepGuice,
-    Dependencies.iepModuleAws
   ))
 
 lazy val `atlas-module-eval` = project
@@ -133,35 +118,12 @@ lazy val `atlas-module-webapi` = project
     Dependencies.iepGuice
   ))
 
-lazy val `atlas-poller` = project
-  .configure(BuildSettings.profile)
-  .dependsOn(`atlas-akka`, `atlas-core`, `atlas-webapi` % "test")
-  .settings(libraryDependencies ++= Seq(
-    Dependencies.akkaHttpCore,
-    Dependencies.akkaTestkit % "test",
-    Dependencies.akkaHttpTestkit % "test",
-    Dependencies.akkaStreamTestkit % "test"
-  ))
-
-lazy val `atlas-poller-cloudwatch` = project
-  .configure(BuildSettings.profile)
-  .dependsOn(`atlas-core`, `atlas-poller`)
-  .settings(libraryDependencies ++= Seq(
-    Dependencies.awsCloudWatch,
-    Dependencies.frigga,
-    Dependencies.iepService,
-    Dependencies.iepModuleLeader,
-    Dependencies.iepLeaderDynamoDb
-  ))
-
 lazy val `atlas-standalone` = project
   .configure(BuildSettings.profile)
   .dependsOn(`atlas-module-akka`, `atlas-module-lwcapi`, `atlas-module-webapi`)
-  .settings(libraryDependencies ++= Seq(
+  .settings(libraryDependencies ++= Dependencies.guiceCoreAndMulti ++ Seq(
     Dependencies.iepGuice,
     Dependencies.iepModuleAtlas,
-    Dependencies.guiceCore,
-    Dependencies.guiceMulti,
     Dependencies.log4jApi,
     Dependencies.log4jCore,
     Dependencies.log4jSlf4j,

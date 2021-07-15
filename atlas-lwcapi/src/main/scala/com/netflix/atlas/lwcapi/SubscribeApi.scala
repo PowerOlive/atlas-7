@@ -16,12 +16,7 @@
 package com.netflix.atlas.lwcapi
 
 import java.nio.charset.StandardCharsets
-
 import akka.NotUsed
-import akka.http.scaladsl.model.HttpEntity
-import akka.http.scaladsl.model.HttpResponse
-import akka.http.scaladsl.model.MediaTypes
-import akka.http.scaladsl.model.StatusCodes
 import akka.http.scaladsl.model.ws.BinaryMessage
 import akka.http.scaladsl.model.ws.Message
 import akka.http.scaladsl.model.ws.TextMessage
@@ -32,6 +27,7 @@ import akka.stream.ThrottleMode
 import akka.stream.scaladsl.BroadcastHub
 import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.Keep
+import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
 import akka.util.ByteString
 import com.netflix.atlas.akka.CustomDirectives._
@@ -40,14 +36,16 @@ import com.netflix.atlas.akka.StreamOps
 import com.netflix.atlas.akka.WebApi
 import com.netflix.atlas.eval.model.LwcDataExpr
 import com.netflix.atlas.eval.model.LwcHeartbeat
+import com.netflix.atlas.eval.model.LwcMessages
 import com.netflix.atlas.eval.model.LwcSubscription
 import com.netflix.atlas.json.JsonSupport
 import com.netflix.iep.NetflixEnvironment
 import com.netflix.spectator.api.Registry
 import com.typesafe.config.Config
 import com.typesafe.scalalogging.StrictLogging
-import javax.inject.Inject
 
+import java.io.ByteArrayOutputStream
+import javax.inject.Inject
 import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
@@ -66,6 +64,7 @@ class SubscribeApi @Inject() (
   import com.netflix.atlas.akka.OpportunisticEC._
 
   private val queueSize = config.getInt("atlas.lwcapi.queue-size")
+  private val batchSize = config.getInt("atlas.lwcapi.batch-size")
 
   private val evalsId = registry.createId("atlas.lwcapi.subscribe.count")
   private val itemsId = registry.createId("atlas.lwcapi.subscribe.itemCount")
@@ -76,25 +75,16 @@ class SubscribeApi @Inject() (
         handleWebSocketMessages(createHandlerFlow(streamId))
       }
     } ~
-    endpointPath("lwc" / "api" / "v1" / "subscribe") {
-      post {
-        parseEntity(json[SubscribeRequest]) {
-          case SubscribeRequest(_, Nil) =>
-            complete(DiagnosticMessage.error(StatusCodes.BadRequest, "empty payload"))
-          case SubscribeRequest(streamId, expressions) =>
-            val errors = subscribe(streamId, expressions)
-            val errorResponse = if (errors.isEmpty) {
-              Errors("success", "success", List())
-            } else {
-              Errors("error", "Some expressions could not be parsed", errors)
-            }
-            val entity = HttpEntity(MediaTypes.`application/json`, errorResponse.toJson)
-            complete(HttpResponse(StatusCodes.OK, entity = entity))
-        }
+    endpointPathPrefix("api" / "v2" / "subscribe") {
+      path(Remaining) { streamId =>
+        handleWebSocketMessages(createHandlerFlowV2(streamId))
       }
     }
   }
 
+  /**
+    * Uses text messages and sends each datapoint individually.
+    */
   private def createHandlerFlow(streamId: String): Flow[Message, Message, Any] = {
     // Drop any other connections that may already be using the same id
     sm.unregister(streamId).foreach { queue =>
@@ -105,25 +95,64 @@ class SubscribeApi @Inject() (
 
     Flow[Message]
       .flatMapConcat {
+        case TextMessage.Strict(str) =>
+          Source.single(str)
         case msg: TextMessage =>
           msg.textStream.fold("")(_ + _)
+        case BinaryMessage.Strict(str) =>
+          Source.single(str.decodeString(StandardCharsets.UTF_8))
         case msg: BinaryMessage =>
           msg.dataStream.fold(ByteString.empty)(_ ++ _).map(_.decodeString(StandardCharsets.UTF_8))
       }
       .via(new WebSocketSessionManager(streamId, register, subscribe))
+      .flatMapMerge(Int.MaxValue, s => s)
+      .map(obj => TextMessage(obj.toJson))
+  }
+
+  /**
+    * Uses a binary format for the messages and batches output to achieve higher throughput.
+    */
+  private def createHandlerFlowV2(streamId: String): Flow[Message, Message, Any] = {
+    // Drop any other connections that may already be using the same id
+    sm.unregister(streamId).foreach { queue =>
+      val msg = DiagnosticMessage.info(s"dropped: another connection is using id: $streamId")
+      queue.offer(msg)
+      queue.complete()
+    }
+
+    Flow[Message]
+      .flatMapConcat {
+        case msg: TextMessage =>
+          // Text messages are not supported, ignore
+          msg.textStream.runWith(Sink.ignore)
+          Source.empty
+        case BinaryMessage.Strict(str) =>
+          Source.single(str)
+        case msg: BinaryMessage =>
+          msg.dataStream.fold(ByteString.empty)(_ ++ _)
+      }
+      .via(new WebSocketSessionManager(streamId, register, subscribe))
       .flatMapMerge(Int.MaxValue, msg => msg)
+      .groupedWithin(batchSize, 1.second)
+      .statefulMapConcat { () =>
+        // Re-use the stream to reduce allocations
+        val baos = new ByteArrayOutputStream()
+
+        { seq =>
+          List(BinaryMessage(LwcMessages.encodeBatch(seq, baos)))
+        }
+      }
   }
 
   private def stepAlignedTime(step: Long): Long = {
     registry.clock().wallTime() / step * step
   }
 
-  private def register(streamId: String): (QueueHandler, Source[Message, Unit]) = {
+  private def register(streamId: String): (QueueHandler, Source[JsonSupport, Unit]) = {
 
     // Create queue to allow messages coming into /evaluate to be passed to this stream
     val (queue, queueSrc) = StreamOps
       .blockingQueue[JsonSupport](registry, "SubscribeApi", queueSize)
-      .map(msg => TextMessage(msg.toJson))
       .toMat(BroadcastHub.sink(1))(Keep.both)
       .run()
 
@@ -142,7 +171,9 @@ class SubscribeApi @Inject() (
           .map(_.metadata.frequency)
           .distinct
           .map { step =>
-            TextMessage(LwcHeartbeat(stepAlignedTime(step), step).toJson)
+            // To account for some delays for data coming from real systems, the heartbeat
+            // timestamp is delayed by one interval
+            LwcHeartbeat(stepAlignedTime(step) - step, step)
           }
         Source(steps)
       }

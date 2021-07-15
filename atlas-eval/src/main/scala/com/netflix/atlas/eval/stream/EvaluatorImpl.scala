@@ -22,7 +22,6 @@ import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
-
 import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
@@ -50,6 +49,8 @@ import com.netflix.atlas.core.model.DataExpr
 import com.netflix.atlas.core.model.Query
 import com.netflix.atlas.eval.model.AggrDatapoint
 import com.netflix.atlas.eval.model.AggrValuesInfo
+import com.netflix.atlas.eval.model.LwcExpression
+import com.netflix.atlas.eval.model.LwcMessages
 import com.netflix.atlas.eval.model.TimeGroup
 import com.netflix.atlas.eval.stream.EurekaSource.Instance
 import com.netflix.atlas.eval.stream.Evaluator.DataSource
@@ -62,8 +63,8 @@ import com.netflix.spectator.api.Registry
 import com.typesafe.config.Config
 import org.reactivestreams.Processor
 import org.reactivestreams.Publisher
+import org.slf4j.LoggerFactory
 
-import scala.collection.mutable
 import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
@@ -79,13 +80,19 @@ private[stream] abstract class EvaluatorImpl(
   implicit val materializer: Materializer
 ) {
 
-  import EvaluatorImpl._
+  private val logger = LoggerFactory.getLogger(getClass)
 
   // Cached context instance used for things like expression validation.
   private val validationStreamContext = newStreamContext()
 
   // Timeout for DataSources unique operator: emit repeating DataSources after timeout exceeds
-  private val uniqueTimeout: Long = config.getDuration("atlas.eval.unique-timeout").toMillis
+  private val uniqueTimeout: Long = config.getDuration("atlas.eval.stream.unique-timeout").toMillis
+
+  // Version of the LWC Server API to use
+  private val lwcapiVersion: Int = config.getInt("atlas.eval.stream.lwcapi-version")
+
+  // Counter for message that cannot be parsed
+  private val badMessages = registry.counter("atlas.eval.badMessages")
 
   private def newStreamContext(dsLogger: DataSourceLogger = (_, _) => ()): StreamContext = {
     new StreamContext(
@@ -117,7 +124,8 @@ private[stream] abstract class EvaluatorImpl(
 
     // Carriage returns can cause a lot of confusion when looking at the file. Clean it up
     // to be more unix friendly before writing to the file.
-    val sink = Flow[ByteString]
+    val sink = Flow[AnyRef]
+      .map(v => ByteString(Json.encode(v)))
       .map(_.filterNot(_ == '\r'))
       .filterNot(_.isEmpty)
       .map(_ ++ ByteString("\n\n"))
@@ -225,7 +233,6 @@ private[stream] abstract class EvaluatorImpl(
       val finalEvalInput = builder.add(Merge[AnyRef](2))
 
       val intermediateEval = createInputFlow(context)
-        .map(ReplayLogging.log)
         .via(context.monitorFlow("10_InputLines"))
         .via(new LwcToAggrDatapoint(context))
         .via(context.monitorFlow("11_LwcDatapoints"))
@@ -369,7 +376,7 @@ private[stream] abstract class EvaluatorImpl(
 
   private[stream] def createInputFlow(
     context: StreamContext
-  ): Flow[DataSources, ByteString, NotUsed] = {
+  ): Flow[DataSources, AnyRef, NotUsed] = {
 
     val g = GraphDSL.create() { implicit builder =>
       import GraphDSL.Implicits._
@@ -379,7 +386,7 @@ private[stream] abstract class EvaluatorImpl(
 
       // Merge the data coming from remote and local before performing
       // the time grouping and aggregation
-      val inputMerge = builder.add(Merge[ByteString](2))
+      val inputMerge = builder.add(Merge[AnyRef](2))
 
       // Streams for remote (lwc-api cluster)
       val remoteFlow =
@@ -389,6 +396,7 @@ private[stream] abstract class EvaluatorImpl(
       val localFlow = Flow[DataSources]
         .flatMapMerge(Int.MaxValue, s => Source(s.getSources.asScala.toList))
         .flatMapMerge(Int.MaxValue, s => context.localSource(Uri(s.getUri)))
+        .flatMapConcat(parseMessage)
 
       // Broadcast to remote/local flow, process and merge
       dataSourcesBroadcast.out(0).map(_.remoteOnly()) ~> remoteFlow ~> inputMerge.in(0)
@@ -417,11 +425,19 @@ private[stream] abstract class EvaluatorImpl(
   // Streams via WebSocket API `/api/v1/subscribe`, from each instance of lwc-api cluster
   private def createClusterStreamFlow(
     context: StreamContext
-  ): Flow[SourcesAndGroups, ByteString, NotUsed] = {
+  ): Flow[SourcesAndGroups, AnyRef, NotUsed] = {
     Flow[SourcesAndGroups]
       .flatMapConcat { sourcesAndGroups =>
         // Cluster message first: need to connect before subscribe
-        Source(List(toClusterMessage(sourcesAndGroups), toDataMessage(sourcesAndGroups, context)))
+        val instances = sourcesAndGroups._2.groups.flatMap(_.instances).toSet
+        val exprs = toExprSet(sourcesAndGroups._1, context.interpreter)
+        val dataMap = instances.map(i => i -> exprs).toMap
+        Source(
+          List(
+            ClusterOps.Cluster(instances),
+            ClusterOps.Data(dataMap)
+          )
+        )
       }
       .via(ClusterOps.groupBy(createGroupByContext(context)))
       .via(context.monitorFlow("02_ConnectionSources"))
@@ -429,61 +445,103 @@ private[stream] abstract class EvaluatorImpl(
 
   private def createGroupByContext(
     context: StreamContext
-  ): ClusterOps.GroupByContext[Instance, DataSources, ByteString] = {
+  ): ClusterOps.GroupByContext[Instance, Set[LwcExpression], AnyRef] = {
     ClusterOps.GroupByContext(
-      instance => createWebSocketFlow(instance, context),
+      instance => createWebSocketFlow(instance),
       registry,
       queueSize = 10
     )
   }
 
-  private def toClusterMessage(
-    sourcesAndGroups: SourcesAndGroups
-  ): ClusterOps.Cluster[Instance, DataSources] = {
-    val instances = sourcesAndGroups._2.groups.flatMap(_.instances).toSet
-    ClusterOps.Cluster(instances)
-  }
-
-  private def toDataMessage(
-    sourcesAndGroups: SourcesAndGroups,
-    context: StreamContext
-  ): ClusterOps.Data[Instance, DataSources] = {
-    val dataSources = sourcesAndGroups._1
-    val instances = sourcesAndGroups._2.groups.flatMap(_.instances).toSet
-    val dataMap = instances.map(i => i -> dataSources).toMap
-    ClusterOps.Data(dataMap)
-  }
-
-  private def toExprSet(dss: DataSources, interpreter: ExprInterpreter): mutable.Set[Expression] = {
-    dss.getSources.asScala
-      .flatMap { dataSource =>
-        interpreter.eval(Uri(dataSource.getUri)).map { expr =>
-          Expression(expr.toString, dataSource.getStep.toMillis)
-        }
+  private def toExprSet(dss: DataSources, interpreter: ExprInterpreter): Set[LwcExpression] = {
+    dss.getSources.asScala.flatMap { dataSource =>
+      interpreter.eval(Uri(dataSource.getUri)).map { expr =>
+        LwcExpression(expr.toString, dataSource.getStep.toMillis)
       }
+    }.toSet
   }
 
   private def createWebSocketFlow(
-    instance: EurekaSource.Instance,
-    context: StreamContext
-  ): Flow[DataSources, ByteString, NotUsed] = {
-    val uri = instance.substitute("ws://{local-ipv4}:{port}") + "/api/v1/subscribe/" +
-      UUID.randomUUID().toString
+    instance: EurekaSource.Instance
+  ): Flow[Set[LwcExpression], AnyRef, NotUsed] = {
+    val base = instance.substitute("ws://{local-ipv4}:{port}")
+    val id = UUID.randomUUID().toString
+    val uri = s"$base/api/v$lwcapiVersion/subscribe/$id"
     val webSocketFlowOrigin = Http(system).webSocketClientFlow(WebSocketRequest(uri))
-    Flow[DataSources]
+    Flow[Set[LwcExpression]]
       .via(StreamOps.unique(uniqueTimeout)) // Updating subscriptions only if there's a change
-      .map(dss => TextMessage(Json.encode(toExprSet(dss, context.interpreter))))
+      .map { exprs =>
+        if (lwcapiVersion == 1)
+          TextMessage(Json.encode(exprs))
+        else
+          BinaryMessage(LwcMessages.encodeBatch(exprs.toSeq))
+      }
       .via(webSocketFlowOrigin)
       .flatMapConcat {
+        case TextMessage.Strict(str) =>
+          parseMessage(str)
         case msg: TextMessage =>
-          msg.textStream.fold("")(_ + _).map(ByteString(_))
+          msg.textStream.fold("")(_ + _).map(parseMessage)
+        case BinaryMessage.Strict(str) =>
+          parseBatch(str)
         case msg: BinaryMessage =>
-          msg.dataStream.fold(ByteString.empty)(_ ++ _)
+          msg.dataStream.fold(ByteString.empty)(_ ++ _).map(parseBatch)
       }
       .mapMaterializedValue(_ => NotUsed)
   }
-}
 
-object EvaluatorImpl {
-  case class Expression(expression: String, step: Long = 60000L)
+  private def parseMessage(message: String): Source[AnyRef, NotUsed] = {
+    try {
+      ReplayLogging.log(message)
+      Source.single(LwcMessages.parse(message))
+    } catch {
+      case e: Exception =>
+        logger.warn(s"failed to process message [$message]", e)
+        badMessages.increment()
+        Source.empty
+    }
+  }
+
+  private def parseBatch(message: ByteString): Source[AnyRef, NotUsed] = {
+    try {
+      ReplayLogging.log(message)
+      Source(LwcMessages.parseBatch(message))
+    } catch {
+      case e: Exception =>
+        logger.warn(s"failed to process message [$message]", e)
+        badMessages.increment()
+        Source.empty
+    }
+  }
+
+  private def parseMessage(message: ByteString): Source[AnyRef, NotUsed] = {
+    try {
+      ReplayLogging.log(message)
+      Source.single(LwcMessages.parse(message))
+    } catch {
+      case e: Exception =>
+        val messageString = toString(message)
+        logger.warn(s"failed to process message [$messageString]", e)
+        badMessages.increment()
+        Source.empty
+    }
+  }
+
+  private def toString(bytes: ByteString): String = {
+    val builder = new StringBuilder()
+    bytes.foreach { b =>
+      val c = b & 0xFF
+      if (isPrintable(c))
+        builder.append(c.asInstanceOf[Char])
+      else if (c <= 0xF)
+        builder.append("\\x0").append(Integer.toHexString(c))
+      else
+        builder.append("\\x").append(Integer.toHexString(c))
+    }
+    builder.toString()
+  }
+
+  private def isPrintable(c: Int): Boolean = {
+    c >= 32 && c < 127
+  }
 }

@@ -16,7 +16,8 @@
 package com.netflix.atlas.core.db
 
 import com.netflix.atlas.core.model.Block
-import com.netflix.atlas.core.model.ConstantBlock
+import com.netflix.atlas.core.model.BlockStats
+import com.netflix.atlas.core.model.CompressedArrayBlock
 import org.scalatest.funsuite.AnyFunSuite
 
 class MemoryBlockStoreSuite extends AnyFunSuite {
@@ -97,10 +98,20 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
   test("update, old data") {
     val bs = new MemoryBlockStore(1, 1, 40)
     bs.update(0, List(1.0, 2.0, 3.0))
-    intercept[IllegalArgumentException] {
-      bs.update(0, List(4.0, 5.0))
-    }
-    assert(bs.fetch(0, 2, Block.Sum).toList === List(1.0, 2.0, 3.0))
+    bs.update(0, List(4.0, 5.0))
+    // previous block can still be updated, but older updates will be ignored
+    assert(bs.fetch(0, 2, Block.Sum).toList === List(1.0, 5.0, 3.0))
+  }
+
+  test("update, old data hour transition") {
+    val bs = new MemoryBlockStore(1, 60, 3)
+    val input = (0 to 61).map(_.toDouble).toList
+    bs.update(0, input)
+    assert(bs.fetch(0, 61, Block.Sum).toList === input)
+
+    bs.update(58, 60.0)
+    bs.update(59, 60.0)
+    assert(bs.fetch(58, 61, Block.Sum).toList === List(60.0, 60.0, 60.0, 61.0))
   }
 
   test("update, overwrite") {
@@ -145,6 +156,7 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
     bs.update(0, List(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
     assert(bs.fetch(0, 1, Block.Sum).forall(_.isNaN))
     assert(bs.fetch(2, 6, Block.Sum).toList === List(3.0, 4.0, 5.0, 6.0, 7.0))
+    bs.fetch(7, 10, Block.Sum).foreach(println)
     assert(bs.fetch(7, 10, Block.Sum).forall(_.isNaN))
   }
 
@@ -156,7 +168,11 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
     assert(bs.currentBlock !== null)
     bs.update(0)
     assert(bs.currentBlock === null)
-    assert(bs.blockList === List(ConstantBlock(0, 10, 2.0)))
+    val expected = CompressedArrayBlock(0, 10)
+    (0 until 10).foreach { i =>
+      expected.update(i, 2.0)
+    }
+    assert(bs.blockList === List(expected))
   }
 
   test("cleanup, nothing to do") {
@@ -189,8 +205,30 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
     assert(bs.fetch(120, 122, Block.Sum).toList === List(4.0, 5.0, 6.0))
   }
 
-  private def blockCounts: List[Long] = {
-    List(BlockStats.arrayCount.get, BlockStats.sparseCount.get, BlockStats.constantCount.get)
+  test("cleanup, flush data") {
+    val step = 60_000L
+    val windowSize = step * 60 * 6
+
+    val baseTime = 2880 * step
+    val blockStore = new MemoryBlockStore(step, 60, 6)
+    val blockMillis = 60 * step
+    var nextFlushTime = baseTime / blockMillis * blockMillis
+    (0 until 1440).foreach { i =>
+      val t = baseTime + i * step
+      val boundary = t / blockMillis * blockMillis
+      if (boundary > nextFlushTime) {
+        blockStore.update(nextFlushTime)
+        nextFlushTime = boundary
+      }
+      blockStore.update(t, i)
+    }
+
+    val end = baseTime + 1440 * step - step
+    val start = end - windowSize + step
+    val data = blockStore.fetch(start, end, Block.Sum)
+    data.indices.foreach { i =>
+      assert(data(i) === 1080.0 + i)
+    }
   }
 
   test("block counts update correctly on roll over") {
@@ -200,10 +238,10 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
     bs.update(0, List(1.0, 2.0, 3.0))
     bs.update(60, List(1.0, 2.0, 3.0))
     bs.update(120, List(1.0, 2.0, 3.0))
-    assert(blockCounts === List(1, 2, 0))
+    assert(BlockStats.overallCount === 3)
 
     bs.update(180, List(1.0, 2.0, 3.0))
-    assert(blockCounts === List(1, 2, 0))
+    assert(BlockStats.overallCount === 3)
   }
 
   test("block counts update correctly on update(ts)") {
@@ -211,10 +249,10 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
 
     val bs = new MemoryBlockStore(1, 60, 3)
     bs.update(0, List(1.0, 2.0, 3.0))
-    assert(blockCounts === List(1, 0, 0))
+    assert(BlockStats.overallCount === 1)
 
     bs.update(0)
-    assert(blockCounts === List(0, 1, 0))
+    assert(BlockStats.overallCount === 1)
   }
 
   test("block counts update correctly on cleanup(ts)") {
@@ -222,10 +260,10 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
 
     val bs = new MemoryBlockStore(1, 60, 3)
     bs.update(0, List(1.0, 2.0, 3.0))
-    assert(blockCounts === List(1, 0, 0))
+    assert(BlockStats.overallCount === 1)
 
     bs.cleanup(60)
-    assert(blockCounts === List(0, 0, 0))
+    assert(BlockStats.overallCount === 0)
   }
 
   test("block counts update for update with gap") {
@@ -234,6 +272,6 @@ class MemoryBlockStoreSuite extends AnyFunSuite {
     val bs = new MemoryBlockStore(1, 60, 3)
     bs.update(0, List(1.0, 2.0, 3.0))
     bs.update(62, List(1.0))
-    assert(blockCounts === List(1, 1, 0))
+    assert(BlockStats.overallCount === 2)
   }
 }
